@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 import pickle
 import time
+import difflib
+import re
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -218,6 +221,9 @@ class RAGTreatmentSearchApp:
         self.df["_region_norm"] = self.df["Region"].apply(_norm)
         self.df["_subzone_norm"] = self.df["Sub-Zone"].apply(_norm)
         self.df["_type_norm"] = self.df["Type"].apply(_norm_type_value)
+        # Build searchable DB sub-zone vocabulary for fuzzy matching
+        self._db_subzone_terms = self._build_db_subzone_terms()
+
 
     def get_regions(self) -> List[str]:
         regions = [r for r in self.df["Region"].dropna().unique().tolist() if str(r).strip() and str(r).strip().lower() != "nan"]
@@ -232,15 +238,91 @@ class RAGTreatmentSearchApp:
             if ss and ss.lower() != "nan":
                 out.append(ss)
         return sorted(out)
+    # ---------------- Sub-zone fuzzy matching ----------------
+
+    def _split_db_subzone(self, s: str) -> List[str]:
+        """
+        DB often has composite strings like:
+          "Cheeks, Cheekbones" or "Jawline / Jowls"
+        Split into individual normalized tokens.
+        """
+        s = _norm(s)
+        if not s:
+            return []
+        parts = re.split(r"[,\|/]|(?:\band\b)", s)
+        parts = [_norm(p) for p in parts]
+        return [p for p in parts if p]
+
+    def _build_db_subzone_terms(self) -> List[str]:
+        """
+        Build a unique list of normalized sub-zone terms present in DB.
+        Includes both full strings and split components.
+        """
+        terms = set()
+
+        for raw in self.df["Sub-Zone"].fillna("").astype(str).tolist():
+            raw = raw.strip()
+            if not raw or raw.lower() == "nan":
+                continue
+
+            terms.add(_norm(raw))
+            for p in self._split_db_subzone(raw):
+                terms.add(p)
+
+        return sorted([t for t in terms if t])
+
+    def _resolve_db_subzones(self, requested_sub_zone: str, max_matches: int = 5) -> List[str]:
+        """
+        Generalized closest-match: map requested sub_zone (from hardcoded list)
+        to the closest DB sub-zone term(s).
+
+        Examples:
+          "teartrough" -> ["tear trough"]
+          "eyes"       -> returns closest DB terms (e.g. "eyelids", etc.) if present
+        """
+        q = _norm(requested_sub_zone)
+        if not q:
+            return []
+
+        # 1) Exact match
+        if q in self._db_subzone_terms:
+            return [q]
+
+        # 2) Substring-based matches (handles "teartrough" vs "tear trough")
+        substring_hits = [t for t in self._db_subzone_terms if (q in t or t in q)]
+        if substring_hits:
+            substring_hits = sorted(substring_hits, key=len)
+            return substring_hits[:max_matches]
+
+        # 3) Fuzzy match
+        return difflib.get_close_matches(q, self._db_subzone_terms, n=max_matches, cutoff=0.62)
+
+    def _subzone_mask(self, sub_zone: str) -> "pd.Series":
+        """
+        Boolean mask of rows whose DB sub-zone matches the requested sub_zone
+        using resolved closest DB terms.
+        """
+        keys = self._resolve_db_subzones(sub_zone)
+        if not keys:
+            return pd.Series([False] * len(self.df), index=self.df.index)
+
+        m = pd.Series([False] * len(self.df), index=self.df.index)
+        for k in keys:
+            # Match whole-ish word boundaries within composite DB strings
+            pat = r"(^|[\s,;/\-|])" + re.escape(k) + r"($|[\s,;/\-|])"
+            m = m | self.df["_subzone_norm"].str.contains(pat, na=False, regex=True)
+
+        return m
 
     def get_concerns_for_subzone(self, sub_zone: str) -> List[str]:
         """
         Get all unique concerns from database for a given sub-zone.
         Extracts concerns from the 'concerns' column.
         """
-        sz = _norm(sub_zone)
-        filtered_df = self.df[self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False)]
-        
+        # sz = _norm(sub_zone)
+        # filtered_df = self.df[self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False)]
+        filtered_df = self.df[self._subzone_mask(sub_zone)]
+
         all_concerns = set()
         for _, row in filtered_df.iterrows():
             concerns_text = _first_present(row, ["concerns", "aesthetic_concerns", "Aesthetic Concerns"])
@@ -259,9 +341,10 @@ class RAGTreatmentSearchApp:
         Find the region that contains the given sub-zone.
         Returns empty string if not found.
         """
-        sz = _norm(sub_zone)
-        matches = self.df[self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False)]
-        
+        # sz = _norm(sub_zone)
+        # matches = self.df[self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False)]
+        matches = self.df[self._subzone_mask(sub_zone)]
+
         if len(matches) > 0:
             region = matches.iloc[0]["Region"]
             return str(region).strip()
@@ -405,13 +488,24 @@ class RAGTreatmentSearchApp:
 
     # ---------------- Retrieval ----------------
 
+    # def _candidate_indices(self, region: str, sub_zone: str, type_norm: str) -> np.ndarray:
+    #     r = _norm(region)
+    #     sz = _norm(sub_zone)
+
+    #     m = self.df["_region_norm"].eq(r)
+    #     if sz:
+    #         m = m & (self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False))
+    #     if type_norm in {"surgical", "non-surgical"}:
+    #         m = m & self.df["_type_norm"].eq(type_norm)
+
+    #     return np.where(m.values)[0]
     def _candidate_indices(self, region: str, sub_zone: str, type_norm: str) -> np.ndarray:
         r = _norm(region)
-        sz = _norm(sub_zone)
 
         m = self.df["_region_norm"].eq(r)
-        if sz:
-            m = m & (self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False))
+        if sub_zone and sub_zone.strip():
+            m = m & self._subzone_mask(sub_zone)
+
         if type_norm in {"surgical", "non-surgical"}:
             m = m & self.df["_type_norm"].eq(type_norm)
 
