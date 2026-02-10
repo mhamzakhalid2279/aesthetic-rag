@@ -233,13 +233,13 @@ class RAGTreatmentSearchApp:
                 out.append(ss)
         return sorted(out)
 
-    def get_all_concerns_for_region(self, region: str) -> List[str]:
+    def get_concerns_for_subzone(self, sub_zone: str) -> List[str]:
         """
-        Get all unique concerns from database for a given region.
+        Get all unique concerns from database for a given sub-zone.
         Extracts concerns from the 'concerns' column.
         """
-        r = _norm(region)
-        filtered_df = self.df[self.df["_region_norm"].eq(r)]
+        sz = _norm(sub_zone)
+        filtered_df = self.df[self.df["_subzone_norm"].eq(sz) | self.df["_subzone_norm"].str.contains(sz, na=False)]
         
         all_concerns = set()
         for _, row in filtered_df.iterrows():
