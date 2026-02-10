@@ -18,8 +18,9 @@ Env:
   OLLAMA_MODEL=llama3.2:1b
 """
 
-from __future__ import annotations
 
+from __future__ import annotations
+import difflib
 import os
 from typing import List, Literal
 
@@ -67,6 +68,24 @@ ALL_SUB_ZONES = FACE_SUB_ZONES + BODY_SUB_ZONES
 # Case-insensitive allowlist
 ALLOWED_SUBZONES = {z.strip().lower(): z for z in ALL_SUB_ZONES}
 ALLOWED_SUBZONES_LIST = sorted(ALLOWED_SUBZONES.keys())
+
+def normalize_subzone_from_request(raw: str) -> str:
+    """
+    Accepts user input like:
+      - tearTrough / teartrough / Tear Trough
+    Returns the closest hardcoded token (lowercase) if it's close enough.
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return ""
+
+    # Exact match
+    if s in ALLOWED_SUBZONES:
+        return s
+
+    # Fuzzy match to hardcoded list (general, not hardcoded aliases)
+    best = difflib.get_close_matches(s, ALLOWED_SUBZONES_LIST, n=1, cutoff=0.72)
+    return best[0] if best else ""
 
 
 # ---------------------------- schemas ----------------------------
@@ -118,17 +137,25 @@ def get_common_concerns(req: CommonConcernsRequest):
         sub_zone: The requested sub-zone
         common_concerns: List of common concerns from database for this sub-zone
     """
-    sub_zone = req.sub_zone.strip().lower()
-    
-    if not sub_zone:
+    #sub_zone = req.sub_zone.strip().lower()
+    sub_zone = normalize_subzone_from_request(req.sub_zone)
+
+    if not (req.sub_zone or "").strip():
         raise HTTPException(status_code=400, detail="sub_zone is required")
-    
-    # Validate sub-zone
-    if sub_zone not in ALLOWED_SUBZONES:
+
+    if not sub_zone:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Invalid sub_zone. Must be one of: {', '.join(ALLOWED_SUBZONES_LIST)}"
         )
+
+    
+    # Validate sub-zone
+    # if sub_zone not in ALLOWED_SUBZONES:
+    #     raise HTTPException(
+    #         status_code=400, 
+    #         detail=f"Invalid sub_zone. Must be one of: {', '.join(ALLOWED_SUBZONES_LIST)}"
+    #     )
     
     # Get common concerns for this sub-zone from database
     concerns = rag.get_concerns_for_subzone(sub_zone)
@@ -164,21 +191,29 @@ def search_procedures(req: SearchRequest):
         recommended_procedures: List of procedure names (empty if mismatch)
         suggested_region_subzones: Suggestions if mismatch
     """
-    sub_zone = req.sub_zone.strip().lower()
+    sub_zone = normalize_subzone_from_request(req.sub_zone)
+
     concerns = [c.strip() for c in req.concerns if c.strip()]
     
-    if not sub_zone:
+    if not (req.sub_zone or "").strip():
         raise HTTPException(status_code=400, detail="sub_zone is required")
+
+    if not sub_zone:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sub_zone. Must be one of: {', '.join(ALLOWED_SUBZONES_LIST)}"
+        )
+
     
     if not concerns:
         raise HTTPException(status_code=400, detail="At least one concern is required")
     
     # Validate sub-zone
-    if sub_zone not in ALLOWED_SUBZONES:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid sub_zone. Must be one of: {', '.join(ALLOWED_SUBZONES_LIST)}"
-        )
+    # if sub_zone not in ALLOWED_SUBZONES:
+    #     raise HTTPException(
+    #         status_code=400, 
+    #         detail=f"Invalid sub_zone. Must be one of: {', '.join(ALLOWED_SUBZONES_LIST)}"
+    #     )
     
     # Get region from sub-zone
     region = rag.get_region_from_subzone(sub_zone)
