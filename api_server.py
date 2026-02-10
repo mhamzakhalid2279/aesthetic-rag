@@ -2,9 +2,10 @@
 """
 DigitalOcean deployment: FastAPI service for Aesthetic RAG Search.
 
-Simplified to 2 APIs:
-1) Get sub-zones for a region
-2) Search with concerns array + procedure type
+3 APIs:
+1) Get common concerns for a selected sub-zone
+2) Validate and return user selections (concerns + procedure type)
+3) Final search to get recommended procedures
 
 Run locally:
   pip install -r requirements.txt
@@ -56,20 +57,31 @@ app.add_middleware(
 TreatmentPreference = Literal["Surgical", "Non-Surgical", "Both"]
 
 
-class SubZonesRequest(BaseModel):
-    region: str = Field(..., min_length=1, description="Selected region (e.g., 'Face', 'Body')")
+class CommonConcernsRequest(BaseModel):
+    sub_zone: str = Field(..., min_length=1, description="Selected sub-zone (e.g., 'Eyes', 'Nose')")
 
 
-class SubZonesResponse(BaseModel):
-    region: str
-    sub_zones: List[str]
-    common_concerns: List[str] = Field(default_factory=list, description="All common concerns for this region")
+class CommonConcernsResponse(BaseModel):
+    sub_zone: str
+    common_concerns: List[str] = Field(description="Common concerns for this sub-zone from database")
+
+
+class UserSelectionRequest(BaseModel):
+    sub_zone: str = Field(..., min_length=1, description="Selected sub-zone")
+    concerns: List[str] = Field(..., min_items=1, description="User selected concerns (one or more)")
+    treatment_preference: TreatmentPreference = Field(..., description="User selected treatment type")
+
+
+class UserSelectionResponse(BaseModel):
+    sub_zone: str
+    concerns: List[str]
+    treatment_preference: str
 
 
 class SearchRequest(BaseModel):
-    sub_zone: str = Field(..., min_length=1, description="Selected sub-zone (e.g., 'Eyes', 'Nose')")
-    concerns: List[str] = Field(..., min_items=1, description="List of selected concerns")
-    treatment_preference: TreatmentPreference = Field("Both", description="Treatment type preference")
+    sub_zone: str = Field(..., min_length=1, description="Sub-zone from API 2")
+    concerns: List[str] = Field(..., min_items=1, description="Concerns array from API 2")
+    treatment_preference: TreatmentPreference = Field(..., description="Treatment type from API 2")
     retrieval_k: int = Field(12, ge=3, le=50, description="Number of candidates to retrieve")
     final_k: int = Field(5, ge=1, le=10, description="Number of final recommendations")
 
@@ -89,46 +101,95 @@ def health():
     return {"status": "ok", "service": "aesthetic-rag-api", "version": "2.0.0"}
 
 
-@app.post("/subzones", response_model=SubZonesResponse)
-def get_subzones(req: SubZonesRequest):
+@app.post("/common_concerns", response_model=CommonConcernsResponse)
+def get_common_concerns(req: CommonConcernsRequest):
     """
-    Get sub-zones and common concerns for a selected region.
+    API 1: Get common concerns for a selected sub-zone from database.
+    
+    Args:
+        sub_zone: Selected sub-zone (e.g., 'Eyes', 'Nose', 'Cheeks')
     
     Returns:
-    - sub_zones: List of available sub-zones for the region
-    - common_concerns: All common concerns from database for this region
+        sub_zone: The requested sub-zone
+        common_concerns: List of common concerns from database for this sub-zone
     """
-    region = req.region.strip()
-    if not region:
-        raise HTTPException(status_code=400, detail="region is required")
+    sub_zone = req.sub_zone.strip()
+    if not sub_zone:
+        raise HTTPException(status_code=400, detail="sub_zone is required")
     
-    # Get sub-zones for this region
-    sub_zones = rag.get_sub_zones(region)
+    # Get common concerns for this sub-zone from database
+    concerns = rag.get_concerns_for_subzone(sub_zone)
     
-    if not sub_zones:
-        raise HTTPException(status_code=404, detail=f"No sub-zones found for region: {region}")
-    
-    # Get all common concerns for this region (from all sub-zones)
-    all_concerns = rag.get_all_concerns_for_region(region)
+    if not concerns:
+        raise HTTPException(status_code=404, detail=f"No concerns found for sub-zone: {sub_zone}")
     
     return {
-        "region": region,
-        "sub_zones": sub_zones,
-        "common_concerns": all_concerns
+        "sub_zone": sub_zone,
+        "common_concerns": concerns
+    }
+
+
+@app.post("/user_selection", response_model=UserSelectionResponse)
+def validate_user_selection(req: UserSelectionRequest):
+    """
+    API 2: Validate and return user selections (concerns + procedure type).
+    
+    User selects:
+    - One or more concerns from API 1 response
+    - One procedure type (Surgical, Non-Surgical, or Both)
+    
+    This API validates the input and returns it for API 3.
+    
+    Args:
+        sub_zone: Selected sub-zone
+        concerns: Array of selected concerns (min 1)
+        treatment_preference: Selected treatment type
+    
+    Returns:
+        sub_zone: The selected sub-zone
+        concerns: The selected concerns array
+        treatment_preference: The selected treatment type
+    """
+    sub_zone = req.sub_zone.strip()
+    concerns = [c.strip() for c in req.concerns if c.strip()]
+    
+    if not sub_zone:
+        raise HTTPException(status_code=400, detail="sub_zone is required")
+    
+    if not concerns:
+        raise HTTPException(status_code=400, detail="At least one concern must be selected")
+    
+    # Validate that sub-zone exists
+    region = rag.get_region_from_subzone(sub_zone)
+    if not region:
+        raise HTTPException(status_code=404, detail=f"Invalid sub-zone: {sub_zone}")
+    
+    return {
+        "sub_zone": sub_zone,
+        "concerns": concerns,
+        "treatment_preference": req.treatment_preference
     }
 
 
 @app.post("/search", response_model=SearchResponse)
 def search_procedures(req: SearchRequest):
     """
-    Search for treatment procedures based on:
-    - sub_zone: Selected sub-zone
-    - concerns: Array of selected concerns
-    - treatment_preference: Surgical, Non-Surgical, or Both
+    API 3: Final search to get recommended procedures.
+    
+    Takes the output from API 2 (user selections) and performs the search.
+    
+    Args:
+        sub_zone: From API 2
+        concerns: From API 2
+        treatment_preference: From API 2
+        retrieval_k: Optional, number of candidates
+        final_k: Optional, number of final results
     
     Returns:
-    - If mismatch: suggested region/sub-zones
-    - If match: list of recommended procedure names only
+        mismatch: Whether mismatch was detected
+        notice: Message if mismatch
+        recommended_procedures: List of procedure names (empty if mismatch)
+        suggested_region_subzones: Suggestions if mismatch
     """
     sub_zone = req.sub_zone.strip()
     concerns = [c.strip() for c in req.concerns if c.strip()]
@@ -138,9 +199,6 @@ def search_procedures(req: SearchRequest):
     
     if not concerns:
         raise HTTPException(status_code=400, detail="At least one concern is required")
-    
-    # Combine concerns into issue text
-    issue_text = ", ".join(concerns)
     
     # Get region from sub-zone
     region = rag.get_region_from_subzone(sub_zone)
