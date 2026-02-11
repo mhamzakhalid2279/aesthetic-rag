@@ -200,7 +200,3 @@ It also supports sub-zones via:
 - `face_subzone` and/or `body_subzone` (preferred)
 
 ---
-
-## License
-
-Add your preferred license (MIT/Apache-2.0/Proprietary) in `LICENSE`.
